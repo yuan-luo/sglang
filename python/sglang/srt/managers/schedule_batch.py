@@ -76,6 +76,7 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
+    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
@@ -354,6 +355,11 @@ class Req:
         custom_logit_processor: Optional[str] = None,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
+        bootstrap_host: Optional[str] = None,
+        bootstrap_port: Optional[int] = None,
+        bootstrap_room: Optional[int] = None,
+        prefill_host: Optional[str] = None,
+        prefill_port: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -483,8 +489,11 @@ class Req:
         self.lora_path = lora_path
 
         # For disaggregation
-        self.bootstrap_host: str = "0.0.0.0"
-        self.bootstrap_room: Optional[int] = None
+        self.bootstrap_host: str = bootstrap_host
+        self.bootstrap_port: int = bootstrap_port
+        self.bootstrap_room: Optional[int] = bootstrap_room
+        self.prefill_host: str = prefill_host
+        self.prefill_port: int = prefill_port
         self.disagg_kv_sender: Optional[KVSender] = None
 
         # used for warmup because we don't have a pair yet when init
@@ -1436,10 +1445,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            (
-                global_server_args_dict["use_mla_backend"]
-                and global_server_args_dict["attention_backend"] == "flashinfer"
-            )
+            global_server_args_dict["enable_flashinfer_mla"]
             or global_server_args_dict["enable_flashmla"]
             or global_server_args_dict["attention_backend"] == "fa3"
         ):

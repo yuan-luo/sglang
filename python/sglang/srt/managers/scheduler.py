@@ -578,7 +578,6 @@ class Scheduler(
                 aux_dtype=aux_dtype,
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
-                bootstrap_port=self.server_args.disaggregation_bootstrap_port,
                 gloo_group=self.tp_worker.get_attention_tp_cpu_group(),
             )
             # The prefill requests that are in the middle of kv sending
@@ -826,6 +825,11 @@ class Scheduler(
                 custom_logit_processor=custom_logit_processor,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
+                bootstrap_host=recv_req.bootstrap_host,
+                bootstrap_port=recv_req.bootstrap_port,
+                bootstrap_room=recv_req.bootstrap_room,
+                prefill_host=recv_req.prefill_host,
+                prefill_port=recv_req.prefill_port,
             )
             req.tokenizer = self.tokenizer
 
