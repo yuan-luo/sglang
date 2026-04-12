@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -169,6 +169,44 @@ def kimi_k2_moe_fused_gate(
         renormalize,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
+    )
+
+
+def kimi_linear_fused_gate(
+    hidden_states: torch.Tensor,
+    router_weights: torch.Tensor,
+    correction_bias: Optional[torch.Tensor] = None,
+    topk: int = 8,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+    renormalize: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused Router GEMM + Sigmoid + Grouped TopK for KimiLinear MoE.
+
+    Combines the router GEMM and biased grouped topk into a single kernel launch.
+    Only supports KimiLinear dimensions: 128 experts, 5120 hidden_dim, bf16 input.
+
+    Args:
+        hidden_states: [M, 5120] bf16 input tokens
+        router_weights: [128, 5120] bf16 router weight matrix
+        correction_bias: [128] float32 bias or None
+        topk: Number of experts to select per token
+        num_expert_group: Number of expert groups (1 = no grouping)
+        topk_group: Number of groups to keep when grouping
+        renormalize: Whether to renormalize topk weights
+
+    Returns:
+        Tuple of (topk_weights [M, topk] float32, topk_ids [M, topk] int32)
+    """
+    return torch.ops.sgl_kernel.kimi_linear_fused_gate.default(
+        hidden_states,
+        router_weights,
+        correction_bias,
+        topk,
+        num_expert_group,
+        topk_group,
+        renormalize,
     )
 
 

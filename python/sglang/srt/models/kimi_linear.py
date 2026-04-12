@@ -30,7 +30,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer
@@ -116,6 +116,20 @@ class KimiMoE(nn.Module):
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
+        # Check if fused gate kernel can be used
+        self._can_use_fused_gate = (
+            hidden_size == 5120
+            and num_experts == 128
+            and quant_config is None
+            and torch.cuda.get_device_capability()[0] >= 9
+        )
+        self._fused_gate_config = {
+            "topk": config.num_experts_per_token,
+            "num_expert_group": config.num_expert_group,
+            "topk_group": config.topk_group,
+            "renormalize": moe_renormalize,
+        }
+
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
             self.shared_experts = KimiMLP(
@@ -126,11 +140,31 @@ class KimiMoE(nn.Module):
                 reduce_results=False,
             )
 
+    def _fused_gate_forward(self, hidden_states: torch.Tensor):
+        """Use the fused GEMM + TopK kernel for gating."""
+        from sgl_kernel import kimi_linear_fused_gate
+
+        topk_weights, topk_ids = kimi_linear_fused_gate(
+            hidden_states,
+            self.gate.weight,
+            self.gate.e_score_correction_bias,
+            self._fused_gate_config["topk"],
+            self._fused_gate_config["num_expert_group"],
+            self._fused_gate_config["topk_group"],
+            self._fused_gate_config["renormalize"],
+        )
+        return StandardTopKOutput(topk_weights, topk_ids, None)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
         shared_output = None
+        use_fused = (
+            self._can_use_fused_gate
+            and 0 < hidden_states.shape[0] <= 16
+            and hidden_states.dtype == torch.bfloat16
+        )
 
         if (
             self.alt_stream is not None
@@ -144,16 +178,22 @@ class KimiMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states.clone())
 
             with torch.cuda.stream(self.alt_stream):
-                router_logits, _ = self.gate(hidden_states)
-                topk_output = self.topk(hidden_states, router_logits)
+                if use_fused:
+                    topk_output = self._fused_gate_forward(hidden_states)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
+                    topk_output = self.topk(hidden_states, router_logits)
                 final_hidden_states = self.experts(hidden_states, topk_output)
 
             current_stream.wait_stream(self.alt_stream)
         else:
             if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
                 shared_output = self.shared_experts(hidden_states)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if use_fused:
+                topk_output = self._fused_gate_forward(hidden_states)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:

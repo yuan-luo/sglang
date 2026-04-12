@@ -196,6 +196,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &kimi_k2_moe_fused_gate);
 
   m.def(
+      "kimi_linear_fused_gate(Tensor hidden_states, Tensor router_weights, Tensor? correction_bias, "
+      "int topk, int num_expert_group, int topk_group, bool renormalize) -> (Tensor, Tensor)");
+  m.impl("kimi_linear_fused_gate", torch::kCUDA, &kimi_linear_fused_gate);
+
+  m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
       "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
       "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "

@@ -302,6 +302,7 @@ set(SOURCES
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"
     "csrc/moe/kimi_k2_moe_fused_gate.cu"
+    "csrc/moe/kimi_linear_fused_gate.cu"
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
