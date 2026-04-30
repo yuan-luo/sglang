@@ -61,7 +61,7 @@ def recompute_w_u_fwd_kernel(
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
     b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+    b_g = tl.math.exp2(tl.load(p_g, boundary_check=(0,)))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(

@@ -19,10 +19,12 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 )
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
-from sglang.srt.layers.attention.fla.op import exp, log
+from sglang.srt.layers.attention.fla.op import exp, exp2, log
 from sglang.srt.layers.attention.fla.utils import check_shared_mem
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+RCP_LN2 = 1.4426950216
 
 
 def cdiv(a: int, b: int) -> int:
@@ -281,16 +283,16 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
         b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
         # [BC, BK]
         b_g = tl.load(p_g, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1)) * exp(b_g - b_gn[None, :])
+        b_k = tl.load(p_k, boundary_check=(0, 1)) * exp2(b_g - b_gn[None, :])
         # [BK, BC]
         b_gk = tl.load(p_gk, boundary_check=(0, 1))
         b_kt = tl.load(b_kt, boundary_check=(0, 1))
         # [BC, BC]
-        b_ktg = b_kt * exp(b_gn[:, None] - b_gk)
+        b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
         b_A += tl.dot(b_k, b_ktg)
 
         b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_qg = b_q * exp(b_g - b_gn[None, :]) * scale
+        b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
         b_Aqk += tl.dot(b_qg, b_ktg)
 
     b_A *= b_b[:, None]
@@ -389,7 +391,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     for j in range(0, min(BC, T - i_t * BT - i_i * BC)):
         b_kt = tl.load(p_kt, mask=m_k, other=0).to(tl.float32)
         b_gk = tl.load(p_gk, mask=m_k, other=0).to(tl.float32)
-        b_ktg = b_kt[None, :] * exp(b_g - b_gk[None, :])
+        b_ktg = b_kt[None, :] * exp2(b_g - b_gk[None, :])
         b_A = tl.sum(b_k * b_ktg, 1)
         b_A = tl.where(o_i > j, b_A, 0.0)
         b_Aqk = tl.sum(b_q * b_ktg, 1)
@@ -593,7 +595,7 @@ def recompute_w_u_fwd_kernel(
             (1, 0),
         )
         b_gk = tl.load(p_gk, boundary_check=(0, 1))
-        b_kb *= exp(b_gk)
+        b_kb *= exp2(b_gk)
         if STORE_QG:
             p_q = tl.make_block_ptr(
                 q + (bos * H + i_h) * K,
@@ -612,7 +614,7 @@ def recompute_w_u_fwd_kernel(
                 (1, 0),
             )
             b_q = tl.load(p_q, boundary_check=(0, 1))
-            b_qg = b_q * exp(b_gk)
+            b_qg = b_q * exp2(b_gk)
             tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
         if STORE_KG:
             last_idx = min(i_t * BT + BT, T) - 1
@@ -622,7 +624,7 @@ def recompute_w_u_fwd_kernel(
             b_gn = tl.load(
                 gk + ((bos + last_idx) * H + i_h) * K + o_k, mask=m_k, other=0.0
             )
-            b_kg = b_k * exp(b_gn - b_gk)
+            b_kg = b_k * exp2(b_gn - b_gk)
 
             p_kg = tl.make_block_ptr(
                 kg + (bos * H + i_h) * K,
@@ -772,7 +774,7 @@ def chunk_gla_fwd_kernel_o(
         # [BT, BK]
         b_g = tl.load(p_g, boundary_check=(0, 1))
         # [BT, BK]
-        b_qg = (b_q * exp(b_g)).to(b_q.dtype)
+        b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         # [BK, BV]
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # works but dkw, owing to divine benevolence
@@ -1051,6 +1053,7 @@ def chunk_kda_fwd(
             g,
             A_log=A_log,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             dt_bias=dt_bias,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
@@ -1061,6 +1064,7 @@ def chunk_kda_fwd(
         g = chunk_local_cumsum(
             g,
             chunk_size=chunk_size,
+            scale=RCP_LN2,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
