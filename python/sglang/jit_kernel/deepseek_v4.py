@@ -97,6 +97,82 @@ def _jit_topk_v2_module(topk: int) -> Module:
 
 
 @cache_once
+def _jit_persistent_topk_module() -> Module:
+    """Persistent top-k kernel ported from vLLM csrc/persistent_topk.cuh.
+
+    No template specialization is baked into the module marker; the C++
+    `persistent_topk(...)` dispatcher branches on the runtime `topk` value
+    (512 / 1024 / 2048) and instantiates the right kernel template for each.
+    """
+    return load_jit(
+        make_name("persistent_topk"),
+        cuda_files=["deepseek_v4/persistent_topk.cuh"],
+        cuda_wrappers=[("persistent_topk", "persistent_topk")],
+    )
+
+
+# Minimum workspace size for persistent_topk in bytes. The C++ side computes
+# the exact requirement (num_groups * sizeof(RadixRowState)) per launch; this
+# upper-bounds it for typical grids (<= ~300 SMs * 1 group/SM * ~3 KB/state).
+PERSISTENT_TOPK_WORKSPACE_BYTES = 1 << 20  # 1 MB
+
+
+def persistent_topk(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    max_seq_len: int,
+    workspace: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Persistent top-k for DeepSeek V3.2 / V4 sparse-attention indexer.
+
+    Adapted from vLLM ``csrc/persistent_topk.cuh`` + ``csrc/topk.cu``.
+
+    Primary win region: ``num_rows`` in ``[1, 32]`` (decode at small batch).
+    For ``num_rows > 32`` with ``>= 128 KB`` smem/block, the C++ side falls
+    back internally to a CUB ``FilteredTopK`` per row. For ``num_rows <= 32``
+    it spreads each large row across many CTAs via a global atomic barrier.
+
+    Parameters
+    ----------
+    logits      : ``(num_rows, stride)`` ``float32`` CUDA tensor.
+    lengths     : ``(num_rows,)`` or ``(num_rows, k)`` ``int32`` CUDA tensor;
+                  per-row valid length used to drive the radix path.
+    topk        : 512, 1024, or 2048.
+    max_seq_len : ``max(lengths)`` — drives the cooperative-barrier gating.
+    workspace   : optional pre-allocated ``uint8`` CUDA workspace
+                  (>= ``PERSISTENT_TOPK_WORKSPACE_BYTES``). Allocated if None.
+    out         : optional pre-allocated ``int32`` ``(num_rows, topk)``.
+                  Allocated if None.
+    """
+    assert logits.is_cuda and lengths.is_cuda
+    assert logits.dtype == torch.float32, f"logits must be float32, got {logits.dtype}"
+    assert lengths.dtype == torch.int32, f"lengths must be int32, got {lengths.dtype}"
+    assert topk in (512, 1024, 2048), f"topk must be 512/1024/2048, got {topk}"
+
+    if out is None:
+        out = torch.empty(
+            (logits.shape[0], topk), dtype=torch.int32, device=logits.device
+        )
+    if workspace is None:
+        workspace = torch.empty(
+            PERSISTENT_TOPK_WORKSPACE_BYTES,
+            dtype=torch.uint8,
+            device=logits.device,
+        )
+    assert workspace.is_cuda and workspace.dtype == torch.uint8
+    assert workspace.numel() >= PERSISTENT_TOPK_WORKSPACE_BYTES, (
+        f"workspace must be >= {PERSISTENT_TOPK_WORKSPACE_BYTES} bytes, "
+        f"got {workspace.numel()}"
+    )
+
+    module = _jit_persistent_topk_module()
+    module.persistent_topk(logits, lengths, out, workspace, int(topk), int(max_seq_len))
+    return out
+
+
+@cache_once
 def _jit_mask_topk_module() -> Module:
     return load_jit(
         make_name("mask_topk"),
