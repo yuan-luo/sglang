@@ -663,11 +663,15 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             torch.tensor(ws, device=device), return_inverse=True
         )
         h_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
+            torch.linspace(
+                0, num_grid_per_side - 1, int(h), dtype=torch.float32, device=device
+            )
             for h in uniq_h.tolist()
         ]
         w_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
+            torch.linspace(
+                0, num_grid_per_side - 1, int(w), dtype=torch.float32, device=device
+            )
             for w in uniq_w.tolist()
         ]
         h_lut_off = _exclusive_prefix([len(x) for x in h_luts])

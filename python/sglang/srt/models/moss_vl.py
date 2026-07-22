@@ -345,8 +345,12 @@ class MossVLVisionModel(nn.Module):
 
         for _, h, w in zip(grid_ts, grid_hs, grid_ws):
             h_int, w_int = int(h.item()), int(w.item())
-            h_idxs = torch.linspace(0, num_grid_per_side - 1, h_int, device=device)
-            w_idxs = torch.linspace(0, num_grid_per_side - 1, w_int, device=device)
+            h_idxs = torch.linspace(
+                0, num_grid_per_side - 1, h_int, dtype=torch.float32, device=device
+            )
+            w_idxs = torch.linspace(
+                0, num_grid_per_side - 1, w_int, dtype=torch.float32, device=device
+            )
 
             h_idxs_floor = h_idxs.int()
             w_idxs_floor = w_idxs.int()
@@ -454,11 +458,15 @@ class MossVLVisionModel(nn.Module):
             torch.tensor(ws, device=device), return_inverse=True
         )
         h_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(h), device=device)
+            torch.linspace(
+                0, num_grid_per_side - 1, int(h), dtype=torch.float32, device=device
+            )
             for h in uniq_h.tolist()
         ]
         w_luts = [
-            torch.linspace(0, num_grid_per_side - 1, int(w), device=device)
+            torch.linspace(
+                0, num_grid_per_side - 1, int(w), dtype=torch.float32, device=device
+            )
             for w in uniq_w.tolist()
         ]
         h_lut_off = _exclusive_prefix([len(x) for x in h_luts])
