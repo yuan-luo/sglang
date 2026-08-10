@@ -37,6 +37,7 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa import litedsa
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -3193,6 +3194,59 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        litedsa_check_out = None
+        if envs.SGLANG_LITEDSA.get() and is_prefill:
+            h = int(layer.tp_q_head_num)
+            group_size = 128 // h if h > 0 and 128 % h == 0 else 0
+            eligible = (
+                forward_batch.batch_size == 1
+                and topk_indices is not None
+                and q_all.dtype == torch.float8_e4m3fn
+                and q_all.shape[-1] == 576
+                and group_size > 0
+                and group_size <= 16
+                and q_all.shape[0] > 0
+                and q_all.shape[0] % group_size == 0
+                and not torch.cuda.is_current_stream_capturing()
+                and litedsa.litedsa_available()
+            )
+            if eligible:
+                from sglang.srt.layers.attention.dsa.dsa_indexer import (
+                    _SPARSE_IDX_VERSION,
+                )
+
+                q_scale = 1.0
+                k_scale = (
+                    layer.k_scale_float
+                    if getattr(layer, "k_scale_float", None) is not None
+                    else 1.0
+                )
+                req_ids = torch.zeros(
+                    q_all.shape[0], dtype=torch.int32, device=q_all.device
+                )
+                litedsa_out = litedsa.litedsa_masked_mqa(
+                    q_all,
+                    kv_cache,
+                    topk_indices,
+                    req_ids,
+                    metadata.real_page_table[:1],
+                    self.real_page_size,
+                    h,
+                    q_scale * float(k_scale) * float(layer.scaling),
+                    float(k_scale),
+                    group_size,
+                    _SPARSE_IDX_VERSION[0],
+                    max_seq_len=int(metadata.max_seq_len_k),
+                ).view(q_all.shape[0], 1, h, 512)
+                if envs.SGLANG_LITEDSA_CHECK.get():
+                    litedsa_check_out = litedsa_out
+                else:
+                    return litedsa_out
+            if not eligible and envs.SGLANG_LITEDSA_REQUIRED.get():
+                raise RuntimeError(
+                    "SGLANG_LITEDSA_REQUIRED=1 but the qualified grouped FP8 attention path declined"
+                )
+
         if self.use_fused_topk:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
@@ -3269,6 +3323,27 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
+
+        if litedsa_check_out is not None:
+            if not torch.isfinite(litedsa_check_out.float()).all():
+                raise RuntimeError("LiteDSA produced non-finite output")
+            ref = out.float()
+            if litedsa_check_out.shape != out.shape:
+                raise RuntimeError(
+                    "LiteDSA output shape mismatch: "
+                    f"got {tuple(litedsa_check_out.shape)}, "
+                    f"stock {tuple(out.shape)}"
+                )
+            got = litedsa_check_out.float()
+            max_abs = (got - ref).abs().max().item()
+            scaled_rel = max_abs / max(ref.abs().max().item(), 1e-6)
+            logger.info(
+                "LITEDSA_CHECK stock comparison max_abs=%.6g scaled_rel=%.6g",
+                max_abs,
+                scaled_rel,
+            )
+            # Online qualification keeps the stock result as the model output.
+            return out
 
         return out
 
@@ -3365,7 +3440,9 @@ class DeepseekSparseAttnBackend(
         SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
-        if (
+        if envs.SGLANG_LITEDSA.get() and forward_mode == ForwardMode.EXTEND:
+            topk_transform_method = TopkTransformMethod.RAGGED
+        elif (
             # disable for MTP
             self.dsa_kv_cache_store_fp8
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8

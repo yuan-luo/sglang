@@ -372,8 +372,8 @@ class SparsePrefillChunkCache:
         )
         return cache
 
-    def ensure_c128(self, c128_page_indices: torch.Tensor) -> None:
-        """Populate c128-side fields from per-query c128 page indices.
+    def ensure_c128_gather(self, c128_page_indices: torch.Tensor) -> None:
+        """Populate only the C128 gather layout from per-query page indices.
 
         ``c128_page_indices[q, j]`` carries slot ids derived from
         ``page_table[q]`` (request-keyed; same across queries of a request)
@@ -387,7 +387,6 @@ class SparsePrefillChunkCache:
         """
         if self.c128_flat_token_ids is not None:
             return
-        device = self.seq_lens.device
         c128_max = max(self.max_seq_len // 128, 1)
         assert c128_max <= c128_page_indices.shape[-1], (
             f"live c128 extent {c128_max} exceeds metadata capacity "
@@ -400,6 +399,21 @@ class SparsePrefillChunkCache:
         # Clamp -1 -> 0 so dequant doesn't OOB; combine masks the invalid
         # tail via topk_len.
         flat_c128_ids = per_req_c128.reshape(-1).clamp_min(0).to(torch.int32)
+        self.c128_flat_token_ids = flat_c128_ids
+
+    def ensure_c128(self, c128_page_indices: torch.Tensor) -> None:
+        """Populate the C128 gather layout and stock combined-index matrix.
+
+        Packed attention consumes positional ranges directly and only needs
+        ``c128_flat_token_ids``.  Keep the much larger per-query combined
+        matrix lazy so the packed fast path does not pay stock setup costs.
+        """
+        if self.c128_combined_indices is not None:
+            return
+        self.ensure_c128_gather(c128_page_indices)
+        assert self.c128_flat_token_ids is not None
+        device = self.seq_lens.device
+        c128_max = max(self.max_seq_len // 128, 1)
         compressed_base = (
             torch.arange(self.num_reqs, dtype=torch.int32, device=device) * c128_max
         ).to(torch.int32)
@@ -425,7 +439,6 @@ class SparsePrefillChunkCache:
             topk=c128_max,
         )
 
-        self.c128_flat_token_ids = flat_c128_ids
         self.c128_combined_indices = combined_indices
         self.c128_combined_lens = combined_lens
 

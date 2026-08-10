@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import litetopk
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -62,6 +63,12 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
+_litetopk_exec_logged = False
+# Monotonic version of the rank-local top-k buffer contents.  Attention
+# consumers use this to cache work only while shared-indexer layers are truly
+# reusing the same indices; the storage pointer itself is not a content
+# version because SGLang overwrites that buffer for later indexer layers.
+_SPARSE_IDX_VERSION = [0]
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -965,6 +972,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
+        # Bump before any kernel writes topk_result.  Shared-indexer consumer
+        # layers do not re-enter this function and therefore retain the same
+        # version, while a new indexer layer invalidates LiteDSA's union cache
+        # even when it reuses the same output allocation.
+        _SPARSE_IDX_VERSION[0] += 1
+
         page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
@@ -996,6 +1009,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         batch_size = len(block_tables)
+        global _litetopk_exec_logged
+
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
         device_index = device.index
@@ -1027,6 +1042,85 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
+
+        # LiteTopK consumes the same contiguous gather used by DeepGEMM.  For
+        # supported single-request prefill shapes it pair-swaps the carried hot
+        # set into that buffer, scans the suffix without ever materializing
+        # [Q, S] logits, and maps winners back to logical ragged positions.
+        # REQUIRED is checked before eligibility so an unsupported scheduler
+        # shape cannot silently turn a qualification run into the stock path.
+        litetopk_enabled = envs.SGLANG_LITETOPK.get()
+        litetopk_required = envs.SGLANG_LITETOPK_REQUIRED.get()
+        litetopk_capturing = (
+            get_is_capture_mode() if litetopk_enabled or litetopk_required else False
+        )
+        required_path_args = {
+            "enabled": litetopk_enabled,
+            "required": litetopk_required,
+            "use_fp4": False,
+            "query_length": token_nums,
+            "sequence_length": int(k_fp8.shape[0]),
+            "num_reqs": batch_size,
+            "capturing": litetopk_capturing,
+            "route": "SGLang FP8 fused indexer",
+        }
+        litetopk_production_ready = litetopk.enforce_required_path(**required_path_args)
+        litetopk_eligible = (
+            litetopk_enabled
+            and litetopk_production_ready
+            and batch_size == 1
+            and not litetopk_capturing
+            and litetopk.supports_fused_query_len(token_nums, use_fp4=False)
+        )
+        if litetopk_eligible:
+            q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                q_fp8[:token_nums], weights[:token_nums]
+            )
+            common_end = int(ke.min().item())
+            window_start = int(ks.min().item())
+            cache_u8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id)
+            cache_u8 = cache_u8.view(cache_u8.shape[0], page_size, 132)
+            plan = litetopk.prepare_permuted_gather(
+                cache_u8,
+                k_fp8,
+                k_scale.view(torch.uint8).reshape(k_fp8.shape[0], 4),
+                block_tables,
+                sequence_length=k_fp8.shape[0],
+                query_length=token_nums,
+                num_reqs=1,
+                common_end=common_end,
+                window_start=window_start,
+                hot_key=layer_id,
+            )
+            if plan is not None and litetopk.try_large_exact_once_chunk(
+                q_padded,
+                k_fp8,
+                k_scale,
+                w_padded,
+                ks,
+                ke,
+                topk_result[:token_nums],
+                self.index_topk,
+                permuted_plan=plan,
+                num_reqs=1,
+                ke_min_hint=common_end,
+                hot_key=layer_id,
+                ks_common_hint=window_start,
+                carry_extent_hint=k_fp8.shape[0],
+            ):
+                if not _litetopk_exec_logged:
+                    print(
+                        "LITETOPK_KERNEL_EXECUTED SGLang FP8 fused indexer "
+                        "dispatched",
+                        flush=True,
+                    )
+                    _litetopk_exec_logged = True
+                return topk_result
+        if litetopk_required and litetopk_production_ready:
+            litetopk.enforce_required_path(
+                **required_path_args,
+                dispatched=False,
+            )
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -1075,6 +1169,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
             raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
             topk_result[:q_offset] = raw_topk_result
+            min_s = litetopk.production_min_s(False)
+            if (
+                envs.SGLANG_LITETOPK.get()
+                and batch_size == 1
+                and k_offset < min_s <= k_offset + q_offset
+            ):
+                litetopk.stash_carry(
+                    layer_id,
+                    raw_topk_result,
+                    k_offset,
+                    next_sequence_length=k_offset + q_offset,
+                )
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM

@@ -1224,6 +1224,21 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
+    # LiteTopK/LiteDSA research kernels. Optimized paths are opt-in; REQUIRED
+    # makes qualification runs fail closed instead of measuring a fallback.
+    SGLANG_LITETOPK = EnvBool(False)
+    SGLANG_LITETOPK_REQUIRED = EnvBool(False)
+    SGLANG_LITETOPK_SO = EnvStr("")
+    SGLANG_LITETOPK_SO_SHA256 = EnvStr("")
+    SGLANG_LITEDSA = EnvBool(False)
+    SGLANG_LITEDSA_REQUIRED = EnvBool(False)
+    SGLANG_LITEDSA_CHECK = EnvBool(False)
+    SGLANG_LITEDSA_SO = EnvStr("")
+    SGLANG_DSV4_PACKED_ATTN = EnvBool(False)
+    SGLANG_DSV4_PACKED_REQUIRED = EnvBool(False)
+    SGLANG_DSV4_PACKED_SO = EnvStr("")
+    SGLANG_DSV4_PACKED_CHECK = EnvBool(False)
+
     # SWA radix cache
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)

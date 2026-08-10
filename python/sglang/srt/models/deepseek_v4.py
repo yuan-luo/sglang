@@ -408,6 +408,43 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def _copy_real_heads_(
+    output: torch.Tensor,
+    ret: torch.Tensor,
+    *,
+    real_num_tokens: int,
+    real_num_heads: int,
+) -> None:
+    """Copy an attention result into a possibly token/head-padded BCG output.
+
+    The stock sparse-prefill kernel returns every padded query head, while the
+    DSV4 packed kernel returns only the real TP-local heads.  Downstream model
+    code immediately slices the output to those real heads, so only that common
+    prefix belongs to the custom-op output contract.
+    """
+    assert (
+        output.ndim == 3 and ret.ndim == 3
+    ), f"DSV4 attention output must be 3D, got {output.shape=} and {ret.shape=}"
+    assert (
+        ret.shape[0] == real_num_tokens
+    ), f"DSV4 attention returned {ret.shape[0]} tokens, expected {real_num_tokens}"
+    assert (
+        output.shape[0] >= real_num_tokens
+    ), f"DSV4 BCG output has {output.shape[0]} token slots, need {real_num_tokens}"
+    assert output.shape[1] >= real_num_heads and ret.shape[1] >= real_num_heads, (
+        "DSV4 attention output does not contain all real heads: "
+        f"{output.shape[1]=}, {ret.shape[1]=}, {real_num_heads=}"
+    )
+    assert (
+        output.shape[2] == ret.shape[2]
+    ), f"DSV4 attention value dimensions differ: {output.shape[2]} != {ret.shape[2]}"
+
+    dst = output[:real_num_tokens, :real_num_heads, :]
+    src = ret[:, :real_num_heads, :]
+    assert dst.shape == src.shape
+    dst.copy_(src)
+
+
 @register_custom_op(mutates_args=["output"])
 @register_split_op()
 def deepseek_v4_attention_with_output(
@@ -446,11 +483,12 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert (
-        output[:real_num_tokens].numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-
-    output[:real_num_tokens].view(ret.shape).copy_(ret)
+    _copy_real_heads_(
+        output,
+        ret,
+        real_num_tokens=real_num_tokens,
+        real_num_heads=attention_layer.tp_q_head_num,
+    )
     return
 
 

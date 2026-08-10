@@ -44,6 +44,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     SharedReadBoundary,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsv4 import packed_attn
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -1742,6 +1743,7 @@ class DeepseekV4AttnBackend(
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
+                    n_local_heads=layer.tp_q_head_num,
                     compress_ratio=compress_ratio,
                     forward_batch=forward_batch,
                     token_to_kv_pool=token_to_kv_pool,
@@ -1798,6 +1800,7 @@ class DeepseekV4AttnBackend(
         self,
         q: torch.Tensor,
         layer_id: int,
+        n_local_heads: int,
         compress_ratio: Literal[0, 4, 128],
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
@@ -1822,20 +1825,66 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-            assert seq_lens_cpu is not None
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+
+            # DP attention shards the flattened extend-token stream across the
+            # local attention-TP ranks, but ForwardBatch retains the unsharded
+            # per-request lengths.  SparsePrefillChunkCache indexes tensors whose
+            # leading dimension is the *local* q tensor, so localize the request
+            # geometry before constructing query_start_loc.  Without this, the
+            # last-query lookup for C128 can address row 16383 in an 8192-row
+            # local tensor for TP4/DP2.
+            global_extend = int(extend_seq_lens.sum().item())
+            local_tokens = int(q_flat.shape[0])
+            # Tiny server-warmup forwards may pad q beyond the one real token;
+            # retain the original metadata in that case.  The real DP-attention
+            # split is the opposite relation: the global extend is wider than
+            # this rank's local q shard.
+            if global_extend > local_tokens:
+                parallel = get_parallel()
+                attn_tp_size = int(parallel.attn_tp_size)
+                attn_tp_rank = int(parallel.attn_tp_rank)
+                if global_extend != local_tokens * attn_tp_size:
+                    raise RuntimeError(
+                        "DSV4 sparse prefill cannot localize DP-attention token "
+                        f"geometry: global_extend={global_extend}, "
+                        f"local_tokens={local_tokens}, attn_tp_size={attn_tp_size}"
+                    )
+                shard_lo = local_tokens * attn_tp_rank
+                shard_hi = shard_lo + local_tokens
+                req_hi = torch.cumsum(extend_seq_lens, dim=0)
+                req_lo = req_hi - extend_seq_lens
+                local_lo = torch.clamp(shard_lo - req_lo, min=0)
+                local_hi = torch.minimum(
+                    extend_seq_lens,
+                    torch.clamp(shard_hi - req_lo, min=0),
+                )
+                local_extend = local_hi - local_lo
+                active = local_extend > 0
+                prefix_lens = seq_lens - extend_seq_lens
+                seq_lens = (prefix_lens + local_hi)[active].contiguous()
+                extend_seq_lens = local_extend[active].contiguous()
+                req_pool_indices = req_pool_indices[active].contiguous()
+                if int(extend_seq_lens.sum().item()) != local_tokens:
+                    raise RuntimeError(
+                        "DSV4 sparse prefill localized request lengths do not "
+                        f"cover local q tokens ({local_tokens})"
+                    )
+
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
+                max_seq_len=int(seq_lens.max().item()),
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1855,7 +1904,7 @@ class DeepseekV4AttnBackend(
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             if compress_ratio == 128:
                 assert core_attn_metadata.c128_page_indices is not None
-                cache.ensure_c128(core_attn_metadata.c128_page_indices)
+                cache.ensure_c128_gather(core_attn_metadata.c128_page_indices)
                 flat_token_ids = cache.c128_flat_token_ids
                 combined_indices = cache.c128_combined_indices
                 combined_lens = cache.c128_combined_lens
@@ -1893,6 +1942,59 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
+        if compress_ratio == 128 and packed_attn.enabled():
+            assert flat_token_ids is not None
+            n_compressed = int(flat_token_ids.shape[0])
+            packed_out = packed_attn.try_packed_prefill(
+                q=q_flat,
+                kv=kv,
+                attn_sink=attn_sink,
+                sm_scale=self.softmax_scale,
+                query_start_loc=cache.query_start_loc,
+                seq_lens=cache.seq_lens,
+                gather_lens=cache.swa_gather_lens,
+                chunk_M=0,
+                chunk_N=n_compressed,
+                window_size=cache.swa_window_size,
+                compress_ratio=128,
+                top_k=n_compressed,
+                n_local_heads=n_local_heads,
+                cache_owner=cache,
+                cache_key=(cache.num_qo_tokens, n_compressed),
+            )
+            ran_packed = packed_out is not None
+            if ran_packed and not packed_attn.checking():
+                return packed_out
+            real_query_tokens = int(
+                (cache.query_start_loc[-1] - cache.query_start_loc[0]).item()
+            )
+            local_heads = int(n_local_heads)
+            pack_group = 128 // local_heads if 128 % local_heads == 0 else 0
+            packed_shape_qualified = (
+                cache.seq_lens.numel() == 1
+                and real_query_tokens == q_flat.shape[0]
+                and q_flat.shape[0] > 0
+                and local_heads <= q_flat.shape[1]
+                and pack_group > 0
+                and q_flat.shape[0] % pack_group == 0
+                and q_flat.shape[-1] == 512
+            )
+            if (
+                not ran_packed
+                and envs.SGLANG_DSV4_PACKED_REQUIRED.get()
+                and packed_shape_qualified
+            ):
+                raise RuntimeError(
+                    "SGLANG_DSV4_PACKED_REQUIRED=1 but the qualified C128 path declined"
+                )
+
+        if compress_ratio == 128 and combined_indices is None:
+            assert core_attn_metadata.c128_page_indices is not None
+            cache.ensure_c128(core_attn_metadata.c128_page_indices)
+            combined_indices = cache.c128_combined_indices
+            combined_lens = cache.c128_combined_lens
+            assert combined_indices is not None and combined_lens is not None
+
         o, _, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
@@ -1902,6 +2004,10 @@ class DeepseekV4AttnBackend(
             attn_sink=attn_sink,
             topk_length=combined_lens,
         )
+        if compress_ratio == 128 and packed_attn.enabled() and packed_attn.checking():
+            packed_attn.report_check(
+                packed_out if ran_packed else None, o, n_local_heads
+            )
         return o
 
     def expand_prefill_casually(
