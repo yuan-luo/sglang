@@ -66,6 +66,9 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     published_masks,
     select_candidate_blocks,
 )
+from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+    PrefillSparseBlockTable,
+)
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
     FusedCompressMetadata,
@@ -1769,6 +1772,14 @@ class DeepseekV4AttnBackend(
                     for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
                 ]
             )
+        elif isinstance(full_masks, PrefillSparseBlockTable):
+            rows, start = [], 0
+            for n, t in zip(full_masks.rows_per_request, tail_lens_cpu):
+                rows.append(torch.arange(start + n - t, start + n))
+                start += n
+            tail_metadata.candidate_metadata = self.candidate_indexer.prefill_rows(
+                full_masks, torch.cat(rows).to(full_masks.blocks.device), tail_lens_cpu
+            )
         # The layers before the switch published top-k into the full metadata's
         # buffers; carry the tail rows into the tail metadata's (padding stays -1).
         full_core = saved[0].core_attn_metadata
@@ -3262,7 +3273,6 @@ class DeepseekV4AttnBackend(
                 )
             return
         k_slots = torch.cat(slot_chunks)
-        k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
 
         q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
         num_heads = q.shape[1]
@@ -3276,26 +3286,45 @@ class DeepseekV4AttnBackend(
             q_lens.to(torch.int64),
             output_size=num_tokens,
         )
-        logits = _dense_fp4_mqa_logits(
-            (q_fp4, q_sf),
-            (k_fp4, k_sf),
-            weights,
-            ks,
-            ks + compress_lens,
-            # the fused top-k reads score rows through 16-byte vectors
-            ceil_align(max(lc_per_req), 4),
-        )
-        if indexer.is_candidate_source or indexer.uses_candidates:
-            self._publish_or_consume_candidates(
-                indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
-            )
         topk = indexer.index_topk
         selected = torch.empty((num_tokens, topk), dtype=torch.int32, device=device)
-        topk_transform_ragged_v2(
-            logits, compress_lens, out_offsets=ks, out_indices=selected
-        )
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = mask_topk_scores(logits, selected, ks)
+        sparse = self._prefill_sparse_indexer(indexer)
+        if sparse is not None and not indexer.is_candidate_source:
+            # a consumer scores its published blocks only
+            self._select_prefill_sparse(
+                layer, sparse, q_fp4, q_sf, weights, ks, out_positions=selected
+            )
+        else:
+            k_fp4, k_sf = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
+            logits = _dense_fp4_mqa_logits(
+                (q_fp4, q_sf),
+                (k_fp4, k_sf),
+                weights,
+                ks,
+                ks + compress_lens,
+                # the fused top-k reads score rows through 16-byte vectors, the
+                # candidate block keys through 32-byte ones
+                ceil_align(max(lc_per_req), 8),
+            )
+            if sparse is not None:
+                self._publish_prefill_sparse(
+                    sparse,
+                    ratio,
+                    logits,
+                    compress_lens,
+                    q_lens,
+                    q_lens_cpu,
+                    q_fp4.dtype,
+                )
+            elif indexer.is_candidate_source or indexer.uses_candidates:
+                self._publish_or_consume_candidates(
+                    indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
+                )
+            topk_transform_ragged_v2(
+                logits, compress_lens, out_offsets=ks, out_indices=selected
+            )
+            if indexer.uses_candidates and not indexer.is_candidate_source:
+                selected = mask_topk_scores(logits, selected, ks)
         # ascending positions, padding last: the layout the consumers expect
         unselected = torch.iinfo(torch.int32).max
         selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
@@ -3308,8 +3337,70 @@ class DeepseekV4AttnBackend(
                 chosen, selected - ks[:, None], -1
             )
 
-    # TODO(candidate): dense-prefill level one / level two inline with masks; move
-    # into the candidate indexer as publish_prefill / select_prefill.
+    def _prefill_sparse_indexer(self, indexer):
+        # None keeps the position-mask path below (Hopper, or CP: its local
+        # rows score the whole prompt, so the page-table rows are not theirs)
+        if self.candidate_indexer is None:
+            return None
+        if not (indexer.is_candidate_source or indexer.uses_candidates):
+            return None
+        if get_parallel().attn_cp_size > 1:
+            return None
+        return self.candidate_indexer
+
+    def _publish_prefill_sparse(
+        self, sparse, ratio, logits, compress_lens, q_lens, q_lens_cpu, q_dtype
+    ) -> None:
+        num_tokens = logits.shape[0]
+        core = self.forward_metadata.core_metadata
+        index_page_size = self.token_to_kv_pool.get_index_k_page_size(ratio)
+        # index-K pool pages of each token's request, at the pool's page size
+        page_table = _expand_index_page_table(
+            core.page_table[:num_tokens],
+            full_page_size=self.page_size,
+            compress_ratio=ratio,
+            index_page_size=index_page_size,
+        ).contiguous()
+        request_ids = torch.repeat_interleave(
+            torch.arange(len(q_lens_cpu), dtype=torch.int32, device=logits.device),
+            q_lens.to(torch.int64),
+            output_size=num_tokens,
+        )
+        self.forward_metadata.candidate_metadata = sparse.publish_prefill(
+            logits,
+            compress_lens,
+            page_table,
+            index_page_size,
+            request_ids,
+            list(q_lens_cpu),
+            q_dtype,
+        )
+
+    def _select_prefill_sparse(
+        self, layer, sparse, q_fp4, q_sf, weights, ks, *, out_positions
+    ) -> None:
+        table = self.forward_metadata.candidate_metadata
+        assert isinstance(table, PrefillSparseBlockTable), "prefill block table missing"
+        pool = self.token_to_kv_pool
+        index_page_size = pool.get_index_k_page_size(layer.compress_ratio)
+        k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+        assert k_cache.dim() == 2
+        k_cache = k_cache.view(k_cache.shape[0], index_page_size, 1, 68)
+        num_tokens, num_heads = q_sf.shape
+        sparse.select_prefill(
+            table,
+            q_fp4.view(num_tokens, 1, num_heads, 64),
+            q_sf.view(num_tokens, 1, num_heads),
+            k_cache,
+            weights,
+            out_positions,
+        )
+        # request-relative positions -> flattened-K columns, as the dense top-k
+        # writes them; the padding stays -1
+        out_positions.add_(torch.where(out_positions >= 0, ks[:, None], 0))
+
+    # Position masks for the platforms without the DeepGEMM two-level indexer
+    # (publish_prefill / select_prefill above): Hopper and the CP layout.
     def _publish_or_consume_candidates(
         self, indexer, logits, compress_lens, lc_per_req, q_lens_cpu, empty_mask
     ) -> None:
