@@ -3,7 +3,9 @@ DeepGEMM `fp8_mqa_logits` + an exact torch top-k."""
 
 import math
 import random
+from types import SimpleNamespace
 from typing import List, Sequence, Tuple
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -385,6 +387,87 @@ def test_sample_grid_cap():
         stride = sample_stride(span)
         assert stride % 2 == 1
         assert -(-span // stride) <= MAX_SAMPLE_TILES * TILE_KEYS, (span, stride)
+
+
+@pytest.mark.skipif(not is_fp8_indexer_supported(), reason="SM100 only")
+@pytest.mark.parametrize("paged", [False, True], ids=["ragged", "paged"])
+def test_tp_row_sharded_lite_topk(paged):
+    """Unequal TP shards, one cut inside a request: offsets and page lookups must use global query rows."""
+    from sglang.srt.layers.attention.dsa import dsa_indexer as dsa
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    ks, ke, keys = make_ragged([(71, 3, "last"), (16384, 10, "last")])
+    rows = ks.numel()
+    batch_ids = (ks != 0).int()
+    page_table = (
+        torch.arange(512, device="cuda", dtype=torch.int32).view(2, 256).flip(1)
+    )
+    seq = torch.tensor([71, 16384], dtype=torch.int32)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, seq_lens_cpu=seq, extend_seq_lens_cpu=[3, 10]
+    )
+    metadata = dsa.DSAIndexerMetadata(
+        attn_metadata=SimpleNamespace(
+            indexer_k_start_end=(ks, ke),
+            indexer_seq_lens_cpu=seq,
+            indexer_seq_lens=seq.cuda(),
+            dsa_seqlens_expanded=ke - ks,
+            token_to_batch_idx=batch_ids,
+            topk_indices_offset=None if paged else ks,
+            indexer_logical_page_table=None,
+            real_page_table=page_table,
+            page_size=64,
+        ),
+        topk_transform_method=dsa.TopkTransformMethod.PAGED
+        if paged
+        else dsa.TopkTransformMethod.RAGGED,
+    )
+    # Constant dot products and strictly increasing key scales: the last visible keys win.
+    fp8 = torch.float8_e4m3fn
+    q = torch.ones(rows + 2, 32, HEAD_DIM, device="cuda").to(fp8)
+    w = torch.ones(rows + 2, 32, 1, device="cuda")
+    kv = torch.ones(keys, HEAD_DIM, device="cuda").to(fp8)
+    scales = 1 + torch.arange(keys, device="cuda", dtype=torch.float32) / 65536
+    pool = SimpleNamespace(
+        index_page_size=64, get_index_k_scale_buffer=lambda *args: (kv, scales)
+    )
+    indexer = dsa.Indexer.__new__(dsa.Indexer)
+    indexer.index_topk, indexer.use_prefill_lite_topk = TOPK, True
+    out = torch.full((rows + 2, TOPK), -9, device="cuda", dtype=torch.int32)
+    # Record actual send buffers; no distributed launcher required to check the rank-ordered gather payload.
+    shards = []
+
+    def gather(local, sizes, output):
+        assert sizes == [5, 8] and local.shape == (sizes[len(shards)], TOPK)
+        assert output.shape == (rows, TOPK) and output.data_ptr() == out.data_ptr()
+        shards.append(local)
+        if len(shards) == len(sizes):
+            torch.cat(shards, out=output)
+
+    group = SimpleNamespace(all_gatherv=gather)
+    with (
+        patch.object(dsa, "dsa_shards_index_k", return_value=False),
+        patch.object(dsa, "get_token_to_kv_pool", return_value=pool),
+    ):
+        for lo, hi in ((0, 5), (5, rows)):
+            indexer._indexer_tp_split = Mock(
+                return_value=dsa._IndexerTpSplit(group, lo, hi, [5, 8])
+            )
+            indexer._get_topk_ragged(False, batch, 0, q, w, metadata, out)
+
+    # The old dispatch returned independently on every rank with no gather.
+    assert len(shards) == 2
+    pos = (ke - ks)[:, None] - 1 - torch.arange(TOPK, device="cuda")
+    if paged:
+        physical = (
+            page_table[batch_ids.long()[:, None], pos.clamp_min(0) // 64] * 64
+            + pos % 64
+        )
+    else:
+        physical = pos + ks[:, None]
+    expected = torch.where(pos < 0, -1, physical).int()
+    torch.testing.assert_close(out[:rows].sort().values, expected.sort().values)
+    assert (out[rows:] == -9).all()
 
 
 if __name__ == "__main__":

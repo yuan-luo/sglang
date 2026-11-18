@@ -204,6 +204,10 @@ class _IndexerTpSplit(NamedTuple):
     row_hi: int
     rows_per_rank: List[int]
 
+    def gather(self, local: torch.Tensor, out: torch.Tensor) -> None:
+        # Contiguous row ranges in rank order reconstruct all live query rows.
+        self.group.all_gatherv(local, sizes=self.rows_per_rank, output=out)
+
 
 if _is_cuda or _is_hip:
     # Plain-torch graph helpers: usable wherever the split-op surface is.
@@ -1835,6 +1839,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        tp_split = self._indexer_tp_split(
+            forward_batch=forward_batch, q_offset=q_offset
+        )
         # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
         # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
         if (
@@ -1844,21 +1851,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not metadata.force_unfused_topk
         ):
             self._prefill_lite_topk(
-                q_fp8[:q_offset],
-                weights[:q_offset],
+                q_fp8,
+                weights,
                 k_fp8,
                 k_scale,
                 ks,
                 ke,
                 metadata,
                 topk_result[:q_offset],
+                tp_split,
             )
             return topk_result
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
         topk_dst = topk_result
-        tp_split = None
         if split:
             row_per, row_slot, row_lo, row_hi = dcp_split_rows(q_offset)
             # Gather in place unless the strides would spill past the real rows.
@@ -1869,14 +1876,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_dst = topk_result.new_empty(
                     (row_per * metadata.dcp_size, topk_result.shape[1])
                 )
+        elif tp_split is None:
+            row_lo, row_hi = 0, q_offset
         else:
-            tp_split = self._indexer_tp_split(
-                forward_batch=forward_batch, q_offset=q_offset
-            )
-            if tp_split is None:
-                row_lo, row_hi = 0, q_offset
-            else:
-                row_lo, row_hi = tp_split.row_lo, tp_split.row_hi
+            row_lo, row_hi = tp_split.row_lo, tp_split.row_hi
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
@@ -2024,10 +2027,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
         if tp_split is not None:
-            # Rank order == row order, so the gather rebuilds rows [0, q_offset).
-            tp_split.group.all_gatherv(
-                dst, sizes=tp_split.rows_per_rank, output=topk_result[:q_offset]
-            )
+            tp_split.gather(dst, topk_result[:q_offset])
         return topk_result
 
     def _prefill_lite_topk(
@@ -2040,30 +2040,39 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ke: torch.Tensor,
         metadata: DSAIndexerMetadata,
         out: torch.Tensor,
+        tp_split: Optional[_IndexerTpSplit],
     ) -> None:
         # The indexer always scores the ragged (gathered) index K, so rows of one request share KV tiles;
         # only the emitted indices differ: RAGGED adds the KV offsets, PAGED maps through the page table.
         # topk_indices_offset is set exactly for RAGGED.
+        # Slice only query rows. ks/ke still address the full gathered key buffer.
+        rows = slice(0, out.shape[0])
+        local = out
+        if tp_split is not None:
+            rows = slice(tp_split.row_lo, tp_split.row_hi)
+            local = out.new_empty((tp_split.row_hi - tp_split.row_lo, self.index_topk))
         offsets = metadata.attn_metadata.topk_indices_offset
         fp8_indexer_topk(
-            q_fp8,
-            weights,
+            q_fp8[rows],
+            weights[rows],
             k_fp8,
             k_scale,
-            ks,
-            ke,
+            ks[rows],
+            ke[rows],
             self.index_topk,
-            out_offsets=None if offsets is None else offsets[: out.shape[0]],
-            out=out,
+            out_offsets=None if offsets is None else offsets[rows],
+            out=local,
         )
         if metadata.topk_transform_method == TopkTransformMethod.PAGED:
             # Through the compact page table (as topk v2 PAGED does): no page_size=1 table needed.
             topk_page_table_transform_(
-                out,
+                local,
                 metadata.get_page_table_64(),
-                metadata.get_token_to_batch_idx()[: out.shape[0]],
+                metadata.get_token_to_batch_idx()[rows],
                 metadata.attn_metadata.page_size,
             )
+        if tp_split is not None:
+            tp_split.gather(local, out)
 
     @staticmethod
     def _dcp_gather_index_k(
