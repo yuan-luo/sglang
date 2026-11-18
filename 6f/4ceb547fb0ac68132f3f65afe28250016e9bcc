@@ -1,0 +1,27 @@
+test/registered/kernels/ops/attention/test_dsa_prefill_fp8_indexer.py
+  s_c77b21dc3eb712::t_e9b26abfb02fe4 458-459
+  s_c77b21dc3eb712::t_df1bf9862c0b1b 6,8,392-401,405-420,424-430,434-452,456-457,460-461,466-470
+  s_c77b21dc3eb712::t_2033f938f7b49a 402-404,421-423,431-433,453-455,462-465
+  s_c77b21dc3eb712::t_08b5a7c69e941c 471-472
+python/sglang/srt/layers/attention/dsa/dsa_indexer.py
+  s_c77b21dc3eb712::t_2d2b24240c81c8 1879-1880,1882
+  s_c77b21dc3eb712::t_2033f938f7b49a 1842-1844
+  s_c77b21dc3eb712::t_0aad46eeb20469 207-209,1854-1855,1862,2030,2043,2048-2053,2056-2057,2060-2061,2063-2064,2069,2071,2074-2075
+  s_c77b21dc3eb712::t_e2eeccd98bed37 210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6f4ceb547fb0ac68132f3f65afe28250016e9bcc",
+  "prompts": {},
+  "sessions": {
+    "s_c77b21dc3eb712": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f9dd3-4140-7080-88e6-8a797a8643b7",
+        "model": "gpt-6.2-astra"
+      },
+      "human_author": "luoyuan.luo <luoyuan.luo@antgroup.com>"
+    }
+  }
+}
